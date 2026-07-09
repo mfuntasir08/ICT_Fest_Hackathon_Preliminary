@@ -1,4 +1,5 @@
 """Booking creation, listing, detail and cancellation."""
+import threading
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
@@ -46,7 +47,8 @@ def _has_conflict(db: Session, room_id: int, start: datetime, end: datetime) -> 
     )
     _pricing_warmup()
     for b in existing:
-        if b.start_time <= end and start <= b.end_time:
+        # --- FIX B3: Changed <= to < to allow back-to-back bookings ---
+        if b.start_time < end and start < b.end_time:
             return True
     return False
 
@@ -82,13 +84,23 @@ def create_booking(
     end = parse_input_datetime(payload.end_time)
     now = datetime.utcnow()
 
-    if start <= now - timedelta(seconds=300):
+    # --- FIX B1: Removed the 5-minute (300s) grace window ---
+    if start <= now:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "start_time must be in the future")
+
+    # --- FIX B2: Added negative/zero duration check ---
+    if end <= start:
+        raise AppError(400, "INVALID_BOOKING_WINDOW", "end_time must be after start_time")
 
     duration_hours = (end - start).total_seconds() / 3600
     if duration_hours != int(duration_hours):
         raise AppError(400, "INVALID_BOOKING_WINDOW", "duration must be a whole number of hours")
     duration_hours = int(duration_hours)
+    
+    # --- FIX B2: Added minimum duration check ---
+    if duration_hours < MIN_DURATION_HOURS:
+        raise AppError(400, "INVALID_BOOKING_WINDOW", "duration out of range")
+        
     if duration_hours > MAX_DURATION_HOURS:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "duration out of range")
 
@@ -163,7 +175,7 @@ def get_booking(
         raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
 
     response = serialize_booking(booking)
-    response["start_time"] = iso_utc(booking.created_at)
+    # --- FIX B8: Removed the line that incorrectly overrode start_time with created_at ---
     response["refunds"] = [
         {
             "amount_cents": r.amount_cents,
@@ -175,52 +187,58 @@ def get_booking(
     return response
 
 
+cancel_lock = threading.Lock()
+
+
 @router.post("/bookings/{booking_id}/cancel")
 def cancel_booking(
     booking_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user), 
 ):
-    booking = (
-        db.query(Booking)
-        .join(Room, Booking.room_id == Room.id)
-        .filter(Booking.id == booking_id, Room.org_id == user.org_id)
-        .first()
-    )
-    if booking is None:
-        raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
-    if user.role != "admin" and booking.user_id != user.id:
-        raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+    with cancel_lock:
+        booking = (
+            db.query(Booking)
+            .join(Room, Booking.room_id == Room.id)
+            .filter(Booking.id == booking_id, Room.org_id == user.org_id)
+            .first()
+        )
+        if booking is None:
+            raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+        if user.role != "admin" and booking.user_id != user.id:
+            raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
 
-    if booking.status == "cancelled":
-        raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
+        if booking.status == "cancelled":
+            raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
 
-    now = datetime.utcnow()
-    notice = booking.start_time - now
-    notice_hours = int(notice.total_seconds() // 3600)
-    if notice_hours > 48:
-        refund_percent = 100
-    elif notice >= timedelta(hours=24):
-        refund_percent = 50
-    else:
-        refund_percent = 50
+        now = datetime.utcnow()
+        notice = booking.start_time - now
+        
+        # --- FIX B4 & B5: Compare timedeltas directly & adjust less than 24h refund percent to 0 ---
+        if notice > timedelta(hours=48):
+            refund_percent = 100
+        elif notice >= timedelta(hours=24):
+            refund_percent = 50
+        else:
+            refund_percent = 0
 
-    refund_amount_cents = round(booking.price_cents * (refund_percent / 100.0))
+        # Note: Ensure this rounding logic aligns perfectly with refunds.py
+        refund_amount_cents = int(booking.price_cents * (refund_percent / 100.0) + 0.5)
 
-    log_refund(db, booking, refund_percent)
+        log_refund(db, booking, refund_percent)
 
-    _settlement_pause()
-    booking.status = "cancelled"
-    db.commit()
+        _settlement_pause()
+        booking.status = "cancelled"
+        db.commit()
 
-    stats.record_cancel(booking.room_id, booking.price_cents)
-    cache.invalidate_report(user.org_id)
-    cache.invalidate_availability(booking.room_id, booking.start_time.date().isoformat())
-    notifications.notify_cancelled(booking)
+        stats.record_cancel(booking.room_id, booking.price_cents)
+        cache.invalidate_report(user.org_id)
+        cache.invalidate_availability(booking.room_id, booking.start_time.date().isoformat())
+        notifications.notify_cancelled(booking)
 
-    return {
-        "id": booking.id,
-        "status": "cancelled",
-        "refund_percent": refund_percent,
-        "refund_amount_cents": refund_amount_cents,
-    }
+        return {
+            "id": booking.id,
+            "status": "cancelled",
+            "refund_percent": refund_percent,
+            "refund_amount_cents": refund_amount_cents,
+        }

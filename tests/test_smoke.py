@@ -56,3 +56,8 @@ def test_core_flow():
     listing = client.get("/bookings", headers=headers)
     assert listing.status_code == 200
     assert listing.json()["total"] >= 1
+
+if __name__ == "__main__":
+    import pytest
+    import sys
+    sys.exit(pytest.main([__file__]))

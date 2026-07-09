@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import os
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -25,15 +26,17 @@ _revoked_tokens: set[str] = set()
 
 # Refresh tokens already exchanged are tracked here to prevent reuse.
 _used_refresh_tokens: set[str] = set()
+_refresh_lock = threading.Lock()
 
 
 def check_and_use_refresh_token(payload: dict) -> None:
     jti = payload.get("jti")
     if not jti:
         raise AppError(401, "UNAUTHORIZED", "Invalid token payload")
-    if jti in _used_refresh_tokens:
-        raise AppError(401, "UNAUTHORIZED", "Refresh token has already been used")
-    _used_refresh_tokens.add(jti)
+    with _refresh_lock:
+        if jti in _used_refresh_tokens:
+            raise AppError(401, "UNAUTHORIZED", "Refresh token has already been used")
+        _used_refresh_tokens.add(jti)
 
 
 _PBKDF2_ROUNDS = 100_000

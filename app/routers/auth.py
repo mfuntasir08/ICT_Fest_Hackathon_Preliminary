@@ -1,5 +1,6 @@
 """Authentication endpoints: register, login, refresh, logout."""
 from fastapi import APIRouter, Depends
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth import (
@@ -25,10 +26,17 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     org = db.query(Organization).filter(Organization.name == payload.org_name).first()
     role = "admin" if org is None else "member"
     if org is None:
-        org = Organization(name=payload.org_name)
-        db.add(org)
-        db.commit()
-        db.refresh(org)
+        try:
+            org = Organization(name=payload.org_name)
+            db.add(org)
+            db.commit()
+            db.refresh(org)
+        except IntegrityError:
+            db.rollback()
+            org = db.query(Organization).filter(Organization.name == payload.org_name).first()
+            if org is None:
+                raise AppError(500, "REGISTRATION_FAILED", "Could not create or find organization")
+            role = "member"
 
     existing = (
         db.query(User)
@@ -38,15 +46,19 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     if existing is not None:
         raise AppError(409, "USERNAME_TAKEN", "Username already taken in this organization")
 
-    user = User(
-        org_id=org.id,
-        username=payload.username,
-        hashed_password=hash_password(payload.password),
-        role=role,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+    try:
+        user = User(
+            org_id=org.id,
+            username=payload.username,
+            hashed_password=hash_password(payload.password),
+            role=role,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    except IntegrityError:
+        db.rollback()
+        raise AppError(409, "USERNAME_TAKEN", "Username already taken in this organization")
     return {
         "user_id": user.id,
         "org_id": org.id,

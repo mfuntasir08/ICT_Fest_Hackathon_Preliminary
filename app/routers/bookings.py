@@ -23,6 +23,8 @@ MAX_DURATION_HOURS = 8
 QUOTA_LIMIT = 3
 QUOTA_WINDOW_HOURS = 24
 
+create_lock = threading.Lock()
+
 
 def _pricing_warmup() -> None:
     # Warm the rate/pricing lookup used while checking for slot conflicts.
@@ -108,32 +110,34 @@ def create_booking(
     if room is None:
         raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
 
-    if _has_conflict(db, room.id, start, end):
-        raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
+    with create_lock:
+        if _has_conflict(db, room.id, start, end):
+            raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
 
-    _check_quota(db, user.id, now, start)
+        if user.role == "member":
+            _check_quota(db, user.id, now, start)
 
-    price_cents = room.hourly_rate_cents * duration_hours
-    booking = Booking(
-        room_id=room.id,
-        user_id=user.id,
-        start_time=start,
-        end_time=end,
-        status="confirmed",
-        reference_code=reference.next_reference_code(),
-        price_cents=price_cents,
-        created_at=now,
-    )
-    db.add(booking)
-    db.commit()
-    db.refresh(booking)
+        price_cents = room.hourly_rate_cents * duration_hours
+        booking = Booking(
+            room_id=room.id,
+            user_id=user.id,
+            start_time=start,
+            end_time=end,
+            status="confirmed",
+            reference_code=reference.next_reference_code(),
+            price_cents=price_cents,
+            created_at=now,
+        )
+        db.add(booking)
+        db.commit()
+        db.refresh(booking)
 
-    stats.record_create(room.id, price_cents)
-    cache.invalidate_availability(room.id, start.date().isoformat())
-    cache.invalidate_report(user.org_id)
-    notifications.notify_created(booking)
+        stats.record_create(room.id, price_cents)
+        cache.invalidate_availability(room.id, start.date().isoformat())
+        cache.invalidate_report(user.org_id)
+        notifications.notify_created(booking)
 
-    return serialize_booking(booking)
+        return serialize_booking(booking)
 
 
 @router.get("/bookings")
@@ -172,6 +176,9 @@ def get_booking(
         .first()
     )
     if booking is None:
+        raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+
+    if user.role != "admin" and booking.user_id != user.id:
         raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
 
     response = serialize_booking(booking)
